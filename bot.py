@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import io
 import math
 import os
 import random
@@ -10,13 +11,20 @@ from datetime import datetime
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ChatMemberStatus, ParseMode
+from dotenv import load_dotenv
+from PIL import Image, ImageDraw
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
+    ChatMemberUpdated,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
 )
 
@@ -24,12 +32,41 @@ from aiogram.types import (
 # НАСТРОЙКИ
 # =========================
 
+load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 # Админ только один - твой Telegram ID.
 ADMIN_ID = 7787565361
 
 DB_FILE = "elections.db"
+MAP_FILE = "map_base.png"
+
+# Карта обновляется автоматически. В тесте чаще, в обычных выборах реже,
+# чтобы не долбить Telegram API сотнями редактирований.
+TEST_MAP_UPDATE_SECONDS = 5.0
+PROD_MAP_UPDATE_SECONDS = 30.0
+
+# Точки внутри регионов на исходной карте 1536x1152.
+# По ним бот автоматически находит внутреннюю область каждого региона
+# через flood fill - отдельные маски/папки не нужны.
+MAP_REGION_SEEDS = {
+    "Малаховщина": (280, 500),
+    "Кошкинская": (115, 650),
+    "Околофутбольная": (210, 690),
+    "Багричевская": (360, 700),
+    "Фазанская": (500, 520),
+    "Победская": (760, 500),
+    "Мельниковская": (760, 735),
+    "57 Дом": (1160, 520),
+}
+
+# Мягкие цвета, чтобы подписи и границы карты оставались читаемыми.
+MAP_PARTY_COLORS = {
+    "Новый 57": (158, 205, 246),
+    "Единый 57": (250, 160, 160),
+    "Бебрики": (255, 224, 125),
+}
+MAP_NEUTRAL_COLOR = (218, 218, 218)
 
 PARTIES = [
     "Новый 57",
@@ -134,6 +171,14 @@ def init_db():
         )
     """)
 
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS live_maps (
+            chat_id INTEGER PRIMARY KEY,
+            message_id INTEGER NOT NULL,
+            created_at REAL NOT NULL
+        )
+    """)
+
     for region, population in REGIONS:
         exists = db_query_one(
             "SELECT region FROM region_config WHERE region = ?",
@@ -163,6 +208,9 @@ def init_db():
         "paused_at": "0",
         "scoreboard_chat_id": "0",
         "scoreboard_message_id": "0",
+        "channel_chat_id": "0",
+        "channel_message_id": "0",
+        "channel_title": "",
     }
     for key, value in defaults.items():
         db_execute(
@@ -486,6 +534,13 @@ def stop_election_without_fill():
 # ТЕКСТ / КНОПКИ
 # =========================
 
+PARTY_ICONS = {
+    "Новый 57": "🟦",
+    "Единый 57": "🟥",
+    "Бебрики": "🟨",
+}
+
+
 def fmt_int(value):
     return f"{int(value):,}".replace(",", " ")
 
@@ -497,25 +552,81 @@ def format_duration(seconds):
     minutes, sec = divmod(rem, 60)
 
     if days:
-        return f"{days}д {hours}ч {minutes}м"
+        return f"{days} д {hours} ч {minutes} мин"
     if hours:
-        return f"{hours}ч {minutes}м {sec}с"
+        return f"{hours} ч {minutes} мин"
     if minutes:
-        return f"{minutes}м {sec}с"
-    return f"{sec}с"
+        return f"{minutes} мин {sec} сек"
+    return f"{sec} сек"
 
 
 def state_title():
     state = election_state()
-    mode = election_mode()
 
     if state == "running":
-        return "ТЕСТ 1 МИНУТА" if mode == "test" else "ВЫБОРЫ ИДУТ"
+        return "🟢 Голосование идет"
     if state == "paused":
-        return "ПАУЗА"
+        return "⏸ Голосование на паузе"
     if state == "finished":
-        return "ВЫБОРЫ ЗАВЕРШЕНЫ"
-    return "ВЫБОРЫ НЕ ЗАПУЩЕНЫ"
+        return "🏁 Голосование завершено"
+    return "⚪ Голосование еще не запущено"
+
+
+def bar(percent, width=10):
+    percent = max(0.0, min(100.0, float(percent)))
+    filled = int(round((percent / 100.0) * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def election_header():
+    state = election_state()
+    now = time.time()
+    ends = float(get_setting("ends_at", "0") or 0)
+
+    lines = [
+        "<b>🏛 Выборы Республики Победа</b>",
+        state_title(),
+    ]
+
+    if state == "running":
+        lines.append(f"До закрытия - <b>{format_duration(ends - now)}</b>")
+    elif state == "paused":
+        lines.append("Подсчет временно остановлен")
+
+    return "\n".join(lines)
+
+
+def home_text(user_id=None):
+    counted = total_virtual_votes()
+    pop = total_population()
+    turnout = (counted / pop * 100.0) if pop else 0.0
+
+    lines = [
+        election_header(),
+        "",
+        f"Явка сейчас - <b>{turnout:.1f}%</b>",
+        f"Учтено бюллетеней - <b>{fmt_int(counted)}</b>",
+    ]
+
+    if user_id:
+        vote = db_query_one(
+            "SELECT region, party FROM real_votes WHERE user_id = ?",
+            (user_id,),
+        )
+        if vote:
+            lines += [
+                "",
+                "✅ Твой голос принят",
+                f"{vote['region']} - {vote['party']}",
+            ]
+        elif is_running():
+            lines += ["", "Твой голос еще не принят."]
+
+    lines += [
+        "",
+        "Здесь можно проголосовать, посмотреть результаты и следить за явкой в реальном времени.",
+    ]
+    return "\n".join(lines)
 
 
 def build_scoreboard(admin=False):
@@ -531,77 +642,123 @@ def build_scoreboard(admin=False):
     global_total = sum(global_votes.values())
 
     lines = [
-        f"{state_title()}",
+        "<b>📊 Результаты</b>",
+        state_title(),
         "",
-        f"Население - {fmt_int(total_pop)}",
-        f"Проголосовало - {fmt_int(counted)}",
-        f"Явка сейчас - {turnout_now:.2f}%",
-        f"Реальных игроков проголосовало - {total_real_voters()}",
+        f"Явка - <b>{turnout_now:.2f}%</b>",
+        bar(turnout_now),
+        f"Бюллетеней - <b>{fmt_int(counted)}</b> из {fmt_int(total_pop)}",
     ]
 
     if state == "running":
-        lines.append(f"До конца - {format_duration(ends - now)}")
+        lines.append(f"До закрытия - <b>{format_duration(ends - now)}</b>")
 
-    lines += ["", "ОБЩИЙ РЕЗУЛЬТАТ"]
+    lines += ["", "<b>Партии</b>"]
 
     for party in PARTIES:
         votes = global_votes[party]
         pct = (votes / global_total * 100.0) if global_total else 0.0
-        lines.append(f"{party} - {fmt_int(votes)} ({pct:.2f}%)")
+        lines += [
+            f"{PARTY_ICONS[party]} <b>{party}</b>",
+            f"{bar(pct)} {pct:.1f}% - {fmt_int(votes)}",
+        ]
 
-    lines += ["", "ПО РЕГИОНАМ"]
+    if admin:
+        lines += [
+            "",
+            f"👤 Реальных игроков - <b>{total_real_voters()}</b>",
+            f"⚙️ Режим - <b>{election_mode() or 'не выбран'}</b>",
+        ]
+
+    return "\n".join(lines)
+
+
+def build_regions_text(admin=False):
+    lines = [
+        "<b>🗺 Регионы</b>",
+        "Текущая явка и распределение по каждому региону.",
+        "",
+    ]
 
     for row in get_regions():
         region = row["region"]
         population = int(row["population"])
         region_votes = virtual_vote_counts(region)
         region_total = sum(region_votes.values())
-        region_turnout = (region_total / population * 100.0) if population else 0.0
+        turnout = (region_total / population * 100.0) if population else 0.0
 
-        shares = []
+        lines.append(f"<b>{region}</b>")
+        lines.append(
+            f"Явка - {turnout:.1f}% | {fmt_int(region_total)} из {fmt_int(population)}"
+        )
+
         for party in PARTIES:
             value = region_votes[party]
             pct = (value / region_total * 100.0) if region_total else 0.0
-            short = {
-                "Новый 57": "Н57",
-                "Единый 57": "Е57",
-                "Бебрики": "Б",
-            }[party]
-            shares.append(f"{short} {pct:.1f}%")
-
-        lines.append(
-            f"{region} - {fmt_int(region_total)}/{fmt_int(population)} "
-            f"({region_turnout:.1f}%) | " + " | ".join(shares)
-        )
+            lines.append(f"{PARTY_ICONS[party]} {party} - {pct:.1f}%")
 
         if admin:
-            target = float(row["turnout_pct"])
             real = real_vote_counts(region)
+            lines.append(f"Скрытая итоговая явка - {float(row['turnout_pct']):.1f}%")
             lines.append(
-                f"  скрытая итоговая явка - {target:.1f}% | "
-                f"реальные: Н57 {real['Новый 57']}, "
-                f"Е57 {real['Единый 57']}, Б {real['Бебрики']}"
+                f"Реальные - Н57 {real['Новый 57']} | "
+                f"Е57 {real['Единый 57']} | Б {real['Бебрики']}"
             )
 
-    if election_mode() == "test" and state in {"running", "paused"}:
-        lines += [
-            "",
-            "Тестовый режим - 3 дня выборов сжаты в 60 секунд.",
-        ]
+        lines.append("")
 
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()
 
 
-def public_menu():
+def public_menu(user_id=None):
+    vote = None
+    if user_id:
+        vote = db_query_one(
+            "SELECT region, party FROM real_votes WHERE user_id = ?",
+            (user_id,),
+        )
+
+    first_button = (
+        InlineKeyboardButton(text="✅ Мой голос", callback_data="pub:myvote")
+        if vote
+        else InlineKeyboardButton(text="🗳 Проголосовать", callback_data="pub:vote")
+    )
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Голосовать", callback_data="pub:vote"),
-                InlineKeyboardButton(text="Результаты", callback_data="pub:results"),
+                first_button,
+                InlineKeyboardButton(text="📊 Результаты", callback_data="pub:results"),
             ],
             [
-                InlineKeyboardButton(text="Мой голос", callback_data="pub:myvote"),
-                InlineKeyboardButton(text="Как работает", callback_data="pub:info"),
+                InlineKeyboardButton(text="🗺 Карта выборов", callback_data="pub:map"),
+                InlineKeyboardButton(text="🏘 Регионы", callback_data="pub:regions"),
+            ],
+            [
+                InlineKeyboardButton(text="ℹ️ О выборах", callback_data="pub:info"),
+            ],
+        ]
+    )
+
+
+def back_home_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="← В главное меню", callback_data="pub:home")]
+        ]
+    )
+
+
+def results_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔄 Обновить", callback_data="pub:results"),
+                InlineKeyboardButton(text="🗺 Карта", callback_data="pub:map"),
+            ],
+            [
+                InlineKeyboardButton(text="🏘 Регионы", callback_data="pub:regions"),
+                InlineKeyboardButton(text="← Назад", callback_data="pub:home"),
             ],
         ]
     )
@@ -610,14 +767,19 @@ def public_menu():
 def regions_keyboard():
     rows = []
     regions = get_regions()
-    for i, row in enumerate(regions):
-        rows.append(
-            [InlineKeyboardButton(
-                text=row["region"],
-                callback_data=f"vote:region:{i}",
-            )]
-        )
-    rows.append([InlineKeyboardButton(text="Назад", callback_data="pub:home")])
+
+    for i in range(0, len(regions), 2):
+        row = []
+        for j in range(i, min(i + 2, len(regions))):
+            row.append(
+                InlineKeyboardButton(
+                    text=regions[j]["region"],
+                    callback_data=f"vote:region:{j}",
+                )
+            )
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton(text="← Назад", callback_data="pub:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -625,12 +787,14 @@ def parties_keyboard(region_index):
     rows = []
     for i, party in enumerate(PARTIES):
         rows.append(
-            [InlineKeyboardButton(
-                text=party,
-                callback_data=f"vote:party:{region_index}:{i}",
-            )]
+            [
+                InlineKeyboardButton(
+                    text=f"{PARTY_ICONS[party]} {party}",
+                    callback_data=f"vote:party:{region_index}:{i}",
+                )
+            ]
         )
-    rows.append([InlineKeyboardButton(text="Назад", callback_data="pub:vote")])
+    rows.append([InlineKeyboardButton(text="← Сменить регион", callback_data="pub:vote")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -639,13 +803,13 @@ def confirm_keyboard(region_index, party_index):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Подтвердить",
+                    text="✅ Подтвердить голос",
                     callback_data=f"vote:confirm:{region_index}:{party_index}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="Изменить",
+                    text="← Выбрать другую партию",
                     callback_data=f"vote:region:{region_index}",
                 )
             ],
@@ -657,28 +821,32 @@ def admin_menu():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Тест 1 мин", callback_data="adm:test"),
-                InlineKeyboardButton(text="Запуск 3 дня", callback_data="adm:prod"),
+                InlineKeyboardButton(text="🧪 Тест 1 мин", callback_data="adm:test"),
+                InlineKeyboardButton(text="🚀 Запуск 3 дня", callback_data="adm:prod"),
             ],
             [
-                InlineKeyboardButton(text="Пауза", callback_data="adm:pause"),
-                InlineKeyboardButton(text="Продолжить", callback_data="adm:resume"),
+                InlineKeyboardButton(text="⏸ Пауза", callback_data="adm:pause"),
+                InlineKeyboardButton(text="▶️ Продолжить", callback_data="adm:resume"),
             ],
             [
-                InlineKeyboardButton(text="Обновить табло", callback_data="adm:update"),
-                InlineKeyboardButton(text="Новое табло", callback_data="adm:publish"),
+                InlineKeyboardButton(text="📊 Табло", callback_data="adm:publish"),
+                InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:update"),
             ],
             [
-                InlineKeyboardButton(text="Админ-статус", callback_data="adm:status"),
-                InlineKeyboardButton(text="Рандом явки", callback_data="adm:turnout"),
+                InlineKeyboardButton(text="🗺 Живая карта", callback_data="adm:map"),
+                InlineKeyboardButton(text="📢 Канал", callback_data="adm:channel"),
             ],
             [
-                InlineKeyboardButton(text="Экспорт CSV", callback_data="adm:export"),
-                InlineKeyboardButton(text="Команды", callback_data="adm:help"),
+                InlineKeyboardButton(text="🏘 Регионы", callback_data="adm:regions"),
+                InlineKeyboardButton(text="⚙️ Статус", callback_data="adm:status"),
             ],
             [
-                InlineKeyboardButton(text="Завершить с досчетом", callback_data="adm:finish"),
-                InlineKeyboardButton(text="Сбросить все", callback_data="adm:reset"),
+                InlineKeyboardButton(text="🎲 Новая явка", callback_data="adm:turnout"),
+                InlineKeyboardButton(text="📤 CSV", callback_data="adm:export"),
+            ],
+            [
+                InlineKeyboardButton(text="🏁 Завершить", callback_data="adm:finish"),
+                InlineKeyboardButton(text="🗑 Сбросить", callback_data="adm:reset"),
             ],
         ]
     )
@@ -688,8 +856,8 @@ def yes_no_keyboard(yes_callback):
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Да", callback_data=yes_callback),
-                InlineKeyboardButton(text="Нет", callback_data="adm:cancel"),
+                InlineKeyboardButton(text="Да, продолжить", callback_data=yes_callback),
+                InlineKeyboardButton(text="Отмена", callback_data="adm:cancel"),
             ]
         ]
     )
@@ -702,26 +870,429 @@ def is_admin(user_id):
 def admin_help_text():
     regions = get_regions()
     region_lines = [
-        f"{i + 1}. {row['region']} - население {fmt_int(row['population'])}"
+        f"{i + 1}. {row['region']} - {fmt_int(row['population'])}"
         for i, row in enumerate(regions)
     ]
 
     return (
-        "АДМИН-КОМАНДЫ\n\n"
-        "/admin - открыть панель\n"
-        "/setpop НОМЕР НАСЕЛЕНИЕ - изменить население региона\n"
-        "/setturnout НОМЕР ПРОЦЕНТ - задать итоговую явку региона\n"
-        "/regions - список регионов и их номеров\n"
-        "/adminstatus - подробная статистика, включая скрытую итоговую явку\n\n"
-        "Примеры:\n"
-        "/setpop 3 15000\n"
-        "/setturnout 3 64.5\n\n"
-        "Регионы:\n"
+        "<b>⚙️ Управление выборами</b>\n\n"
+        "<b>Команды</b>\n"
+        "/setpop НОМЕР НАСЕЛЕНИЕ\n"
+        "/setturnout НОМЕР ПРОЦЕНТ\n"
+        "/adminstatus\n"
+        "/regions\n\n"
+        "<b>Примеры</b>\n"
+        "<code>/setpop 3 15000</code>\n"
+        "<code>/setturnout 3 64.5</code>\n\n"
+        "<b>Номера регионов</b>\n"
         + "\n".join(region_lines)
-        + "\n\n"
-        "Важно: админка не умеет тайно добавлять голоса конкретной партии. "
-        "Можно менять только параметры симуляции - население, явку, запуск, паузу и сброс."
     )
+
+
+# =========================
+# ЖИВАЯ КАРТА
+# =========================
+
+def region_leader(region):
+    votes = virtual_vote_counts(region)
+    total = sum(votes.values())
+    if total <= 0:
+        return None
+
+    best = max(votes.values())
+    leaders = [party for party, value in votes.items() if value == best]
+
+    if len(leaders) != 1:
+        return None
+
+    return leaders[0]
+
+
+def render_election_map_png():
+    path = Path(MAP_FILE)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Не найден {MAP_FILE}. Положи файл карты рядом с bot.py."
+        )
+
+    base = Image.open(path).convert("RGB")
+    gray = base.convert("L")
+
+    # Все почти-белое считаем внутренним пространством.
+    # Черные линии и подписи остаются препятствиями для flood fill.
+    binary = gray.point(lambda p: 255 if p > 210 else 0).convert("L")
+    result = base.copy()
+
+    for region, seed in MAP_REGION_SEEDS.items():
+        if seed[0] >= base.width or seed[1] >= base.height:
+            continue
+
+        leader = region_leader(region)
+        color = MAP_PARTY_COLORS.get(leader, MAP_NEUTRAL_COLOR)
+
+        work = binary.copy()
+        ImageDraw.floodfill(work, seed, 128)
+        mask = work.point(lambda p: 255 if p == 128 else 0)
+
+        fill = Image.new("RGB", base.size, color)
+        result.paste(fill, mask=mask)
+
+    # Возвращаем поверх заливки оригинальные черные границы и подписи.
+    dark_mask = gray.point(lambda p: 255 if p < 180 else 0)
+    result.paste(base, mask=dark_mask)
+
+    output = io.BytesIO()
+    result.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def build_map_caption():
+    counted = total_virtual_votes()
+    pop = total_population()
+    turnout = (counted / pop * 100.0) if pop else 0.0
+
+    lines = [
+        "<b>🗺 Карта выборов</b>",
+        state_title(),
+        "",
+        "Цвет региона показывает партию, которая лидирует прямо сейчас.",
+        "",
+        "🟦 Новый 57",
+        "🟥 Единый 57",
+        "🟨 Бебрики",
+        "⬜ Ничья / голосов пока нет",
+        "",
+        f"Явка - <b>{turnout:.1f}%</b>",
+        f"Учтено бюллетеней - <b>{fmt_int(counted)}</b>",
+    ]
+
+    if is_running():
+        ends = float(get_setting("ends_at", "0") or 0)
+        lines.append(f"До закрытия - <b>{format_duration(ends - time.time())}</b>")
+
+    lines += [
+        "",
+        "Карта обновляется автоматически.",
+    ]
+    return "\n".join(lines)
+
+
+def map_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить сейчас",
+                    callback_data="pub:map_refresh",
+                ),
+                InlineKeyboardButton(
+                    text="📊 Результаты",
+                    callback_data="pub:results",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🏠 Главное меню",
+                    callback_data="pub:home",
+                )
+            ],
+        ]
+    )
+
+
+def register_live_map(chat_id, message_id):
+    db_execute(
+        """
+        INSERT INTO live_maps(chat_id, message_id, created_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            message_id = excluded.message_id,
+            created_at = excluded.created_at
+        """,
+        (chat_id, message_id, time.time()),
+    )
+
+
+def unregister_live_map(chat_id):
+    db_execute("DELETE FROM live_maps WHERE chat_id = ?", (chat_id,))
+
+
+async def send_live_map(chat_id):
+    png = render_election_map_png()
+    msg = await bot.send_photo(
+        chat_id=chat_id,
+        photo=BufferedInputFile(png, filename="election_map.png"),
+        caption=build_map_caption(),
+        reply_markup=map_keyboard(),
+    )
+    register_live_map(msg.chat.id, msg.message_id)
+    return msg
+
+
+async def refresh_live_map_message(chat_id, message_id):
+    png = render_election_map_png()
+    media = InputMediaPhoto(
+        media=BufferedInputFile(png, filename="election_map.png"),
+        caption=build_map_caption(),
+        parse_mode=ParseMode.HTML,
+    )
+
+    await bot.edit_message_media(
+        chat_id=chat_id,
+        message_id=message_id,
+        media=media,
+        reply_markup=map_keyboard(),
+    )
+
+
+last_live_map_update = 0.0
+
+
+async def update_live_maps(force=False):
+    global last_live_map_update
+
+    mode = election_mode()
+    interval = (
+        TEST_MAP_UPDATE_SECONDS
+        if mode == "test"
+        else PROD_MAP_UPDATE_SECONDS
+    )
+
+    now = time.time()
+    if not force and now - last_live_map_update < interval:
+        return
+
+    rows = db_query_all(
+        "SELECT chat_id, message_id FROM live_maps ORDER BY created_at DESC"
+    )
+    if not rows:
+        last_live_map_update = now
+        return
+
+    # Рендерим карту один раз, даже если ее сейчас смотрят несколько человек.
+    png = render_election_map_png()
+    caption = build_map_caption()
+
+    for row in rows:
+        chat_id = int(row["chat_id"])
+        message_id = int(row["message_id"])
+
+        try:
+            media = InputMediaPhoto(
+                media=BufferedInputFile(png, filename="election_map.png"),
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+            )
+            await bot.edit_message_media(
+                chat_id=chat_id,
+                message_id=message_id,
+                media=media,
+                reply_markup=map_keyboard(),
+            )
+        except TelegramBadRequest as e:
+            text = str(e).lower()
+
+            if "message is not modified" in text:
+                continue
+
+            if (
+                "message to edit not found" in text
+                or "message can't be edited" in text
+                or "message identifier is not specified" in text
+            ):
+                unregister_live_map(chat_id)
+                continue
+
+            print("live map TelegramBadRequest:", repr(e))
+
+        except TelegramForbiddenError:
+            unregister_live_map(chat_id)
+
+        except Exception as e:
+            print("live map update error:", repr(e))
+
+    last_live_map_update = now
+
+
+
+# =========================
+# КАРТА В TELEGRAM-КАНАЛЕ
+# =========================
+
+last_channel_map_update = 0.0
+
+
+def connected_channel_id():
+    return int(get_setting("channel_chat_id", "0") or 0)
+
+
+def connected_channel_message_id():
+    return int(get_setting("channel_message_id", "0") or 0)
+
+
+def channel_admin_text():
+    channel_id = connected_channel_id()
+    title = get_setting("channel_title", "").strip()
+
+    if channel_id:
+        name = title or str(channel_id)
+        return (
+            "<b>📢 Канал с картой подключен</b>\n\n"
+            f"Канал - <b>{name}</b>\n\n"
+            "В канал бот отправляет только одну карту выборов. "
+            "Никаких результатов, команд, уведомлений или служебных сообщений туда не публикуется.\n\n"
+            "Карта не спамит новыми постами - бот редактирует один и тот же пост по ходу выборов."
+        )
+
+    return (
+        "<b>📢 Канал с картой</b>\n\n"
+        "Чтобы подключить канал:\n\n"
+        "1. Добавь этого бота в нужный Telegram-канал.\n"
+        "2. Назначь его администратором.\n"
+        "3. Разреши ему публиковать и редактировать сообщения.\n"
+        "4. Добавление или назначение админом должен выполнить твой аккаунт.\n\n"
+        "После этого бот сам опубликует в канале карту и запомнит канал.\n\n"
+        "В канал будет уходить только карта - без текстовых сводок и без админских сообщений."
+    )
+
+
+def channel_admin_keyboard():
+    channel_id = connected_channel_id()
+
+    if channel_id:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🔄 Обновить карту",
+                        callback_data="adm:channel_refresh",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="❌ Отключить канал",
+                        callback_data="adm:channel_disconnect",
+                    )
+                ],
+            ]
+        )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Проверить статус",
+                    callback_data="adm:channel",
+                )
+            ]
+        ]
+    )
+
+
+async def publish_or_update_channel_map(force_new=False):
+    """
+    В канал отправляется только изображение без подписи и без кнопок.
+    Обычно редактируется один и тот же пост.
+    """
+    global last_channel_map_update
+
+    chat_id = connected_channel_id()
+    if not chat_id:
+        return False
+
+    message_id = connected_channel_message_id()
+    png = render_election_map_png()
+
+    if message_id and not force_new:
+        try:
+            media = InputMediaPhoto(
+                media=BufferedInputFile(png, filename="election_map.png"),
+            )
+            await bot.edit_message_media(
+                chat_id=chat_id,
+                message_id=message_id,
+                media=media,
+            )
+            last_channel_map_update = time.time()
+            return True
+
+        except TelegramBadRequest as e:
+            text = str(e).lower()
+
+            if "message is not modified" in text:
+                last_channel_map_update = time.time()
+                return True
+
+            if (
+                "message to edit not found" not in text
+                and "message can't be edited" not in text
+            ):
+                print("channel map edit error:", repr(e))
+                return False
+
+        except TelegramForbiddenError as e:
+            print("channel map forbidden:", repr(e))
+            return False
+
+    try:
+        msg = await bot.send_photo(
+            chat_id=chat_id,
+            photo=BufferedInputFile(png, filename="election_map.png"),
+        )
+        set_setting("channel_message_id", msg.message_id)
+        last_channel_map_update = time.time()
+        return True
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        print("channel map publish error:", repr(e))
+        return False
+
+
+async def update_channel_map(force=False):
+    global last_channel_map_update
+
+    if not connected_channel_id():
+        return False
+
+    mode = election_mode()
+    interval = (
+        TEST_MAP_UPDATE_SECONDS
+        if mode == "test"
+        else PROD_MAP_UPDATE_SECONDS
+    )
+
+    now = time.time()
+    if not force and now - last_channel_map_update < interval:
+        return False
+
+    return await publish_or_update_channel_map(force_new=False)
+
+
+async def disconnect_channel(delete_post=True):
+    chat_id = connected_channel_id()
+    message_id = connected_channel_message_id()
+
+    if delete_post and chat_id and message_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
+
+    set_setting("channel_chat_id", "0")
+    set_setting("channel_message_id", "0")
+    set_setting("channel_title", "")
+
+
+async def connect_channel(chat_id, title=""):
+    old_chat_id = connected_channel_id()
+
+    if old_chat_id and old_chat_id != chat_id:
+        await disconnect_channel(delete_post=True)
+
+    set_setting("channel_chat_id", chat_id)
+    set_setting("channel_message_id", "0")
+    set_setting("channel_title", title or "")
+
+    return await publish_or_update_channel_map(force_new=True)
 
 
 # =========================
@@ -731,6 +1302,51 @@ def admin_help_text():
 dp = Dispatcher()
 bot = None
 last_scoreboard_update = 0.0
+
+
+@dp.my_chat_member()
+async def on_my_chat_member(event: ChatMemberUpdated):
+    # Подключаем только каналы. Группы бот игнорирует.
+    if event.chat.type != "channel":
+        return
+
+    # Только владелец админки может привязать канал к боту.
+    if not event.from_user or event.from_user.id != ADMIN_ID:
+        return
+
+    status = event.new_chat_member.status
+
+    if status == ChatMemberStatus.ADMINISTRATOR:
+        ok = await connect_channel(
+            chat_id=event.chat.id,
+            title=event.chat.title or "",
+        )
+
+        # Сообщение отправляем админу в личку, а не в канал.
+        try:
+            if ok:
+                await bot.send_message(
+                    ADMIN_ID,
+                    "<b>📢 Канал подключен</b>\n\n"
+                    f"{event.chat.title or event.chat.id}\n\n"
+                    "В канал опубликована карта выборов. "
+                    "Дальше бот будет редактировать только этот пост.",
+                )
+            else:
+                await bot.send_message(
+                    ADMIN_ID,
+                    "<b>Не удалось опубликовать карту в канале.</b>\n\n"
+                    "Проверь права бота на публикацию и редактирование сообщений.",
+                )
+        except Exception:
+            pass
+
+    elif status in {
+        ChatMemberStatus.LEFT,
+        ChatMemberStatus.KICKED,
+    }:
+        if connected_channel_id() == event.chat.id:
+            await disconnect_channel(delete_post=False)
 
 
 async def safe_edit(message, text, reply_markup=None):
@@ -804,6 +1420,8 @@ async def simulation_loop():
                 if ends_at > 0 and time.time() >= ends_at:
                     finalize_election()
                     await update_scoreboard(force=True)
+                    await update_live_maps(force=True)
+                    await update_channel_map(force=True)
 
                     chat_id = int(get_setting("scoreboard_chat_id", "0") or 0)
                     if chat_id:
@@ -815,6 +1433,8 @@ async def simulation_loop():
                     changed = simulate_one_tick()
                     if changed:
                         await update_scoreboard(force=False)
+                        await update_live_maps(force=False)
+                        await update_channel_map(force=False)
 
             await asyncio.sleep(SIMULATION_TICK_SECONDS)
 
@@ -826,17 +1446,10 @@ async def simulation_loop():
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    text = (
-        "Выборы Республики Победа\n\n"
-        "Один Telegram-аккаунт - один реальный голос.\n"
-        "Реальные голоса задают текущую поддержку партий, а бот постепенно "
-        "генерирует поток бюллетеней с учетом населения и явки каждого региона.\n\n"
-        "Выбирай действие:"
+    await message.answer(
+        home_text(message.from_user.id),
+        reply_markup=public_menu(message.from_user.id),
     )
-    if is_admin(message.from_user.id):
-        text += "\n\nАдмин-панель - /admin"
-
-    await message.answer(text, reply_markup=public_menu())
 
 
 @dp.message(Command("results"))
@@ -850,9 +1463,13 @@ async def cmd_admin(message: Message):
         await message.answer("Команда недоступна.")
         return
 
+    state = election_state()
+    mode = election_mode() or "не выбран"
     await message.answer(
-        "Админ-панель\n\n"
-        "Все кнопки ниже работают только для твоего Telegram ID.",
+        "<b>⚙️ Админ-панель</b>\n\n"
+        f"Состояние - <b>{state}</b>\n"
+        f"Режим - <b>{mode}</b>\n\n"
+        "Выбери действие:",
         reply_markup=admin_menu(),
     )
 
@@ -907,6 +1524,8 @@ async def cmd_setpop(message: Message):
     )
     await message.answer(f"{region} - население теперь {fmt_int(population)}.")
     await update_scoreboard(force=True)
+    await update_live_maps(force=True)
+    await update_channel_map(force=True)
 
 
 @dp.message(Command("setturnout"))
@@ -943,14 +1562,16 @@ async def cmd_setturnout(message: Message):
     )
     await message.answer(f"{region} - итоговая явка выставлена на {turnout:.1f}%.")
     await update_scoreboard(force=True)
+    await update_live_maps(force=True)
+    await update_channel_map(force=True)
 
 
 @dp.callback_query(F.data == "pub:home")
 async def pub_home(callback: CallbackQuery):
     await safe_edit(
         callback.message,
-        "Выборы Республики Победа\n\nВыбирай действие:",
-        reply_markup=public_menu(),
+        home_text(callback.from_user.id),
+        reply_markup=public_menu(callback.from_user.id),
     )
     await callback.answer()
 
@@ -960,38 +1581,65 @@ async def pub_results(callback: CallbackQuery):
     await safe_edit(
         callback.message,
         build_scoreboard(),
+        reply_markup=results_keyboard(),
+    )
+    await callback.answer("Обновлено")
+
+
+@dp.callback_query(F.data == "pub:map")
+async def pub_map(callback: CallbackQuery):
+    await send_live_map(callback.message.chat.id)
+    await callback.answer("Живая карта открыта")
+
+
+@dp.callback_query(F.data == "pub:map_refresh")
+async def pub_map_refresh(callback: CallbackQuery):
+    try:
+        await refresh_live_map_message(
+            callback.message.chat.id,
+            callback.message.message_id,
+        )
+        register_live_map(
+            callback.message.chat.id,
+            callback.message.message_id,
+        )
+        await callback.answer("Карта обновлена")
+    except Exception as e:
+        print("manual map refresh error:", repr(e))
+        await callback.answer("Не удалось обновить карту.", show_alert=True)
+
+
+@dp.callback_query(F.data == "pub:regions")
+async def pub_regions(callback: CallbackQuery):
+    await safe_edit(
+        callback.message,
+        build_regions_text(),
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="Обновить", callback_data="pub:results")],
-                [InlineKeyboardButton(text="Назад", callback_data="pub:home")],
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="pub:regions")],
+                [InlineKeyboardButton(text="← Назад", callback_data="pub:home")],
             ]
         ),
     )
-    await callback.answer()
+    await callback.answer("Обновлено")
 
 
 @dp.callback_query(F.data == "pub:info")
 async def pub_info(callback: CallbackQuery):
     text = (
-        "Как работает симуляция\n\n"
-        "1. Каждый реальный человек выбирает свой регион и одну партию.\n"
-        "2. Один Telegram ID может проголосовать только один раз за текущие выборы.\n"
-        "3. У каждого региона есть свое население и итоговая явка ниже 100%.\n"
-        "4. Бюллетени появляются постепенно, а не сразу.\n"
-        "5. Новые пачки распределяются с учетом реальных голосов в конкретном регионе.\n"
-        "6. Если реальные голоса меняют расклад, уже посчитанные бюллетени не переписываются. "
-        "Меняются только следующие пачки.\n"
-        "7. Есть небольшой случайный шум, поэтому каждая пачка не повторяет проценты идеально.\n\n"
-        "Обычный режим идет 3 дня. Тестовый режим у админа сжимает эти 3 дня в 60 секунд."
+        "<b>ℹ️ Как проходят выборы</b>\n\n"
+        "Голосование длится 3 дня.\n\n"
+        "Каждый участник выбирает свой регион и одну партию. "
+        "Реальные голоса задают направление поддержки в регионе, после чего "
+        "бот постепенно добавляет виртуальные бюллетени с небольшим случайным разбросом.\n\n"
+        "Явка зависит от региона и не достигает 100%. "
+        "Уже подсчитанные бюллетени не меняются - новые реальные голоса влияют только на следующие поступления.\n\n"
+        "Результаты и явка обновляются по ходу голосования."
     )
     await safe_edit(
         callback.message,
         text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="Назад", callback_data="pub:home")]
-            ]
-        ),
+        reply_markup=back_home_keyboard(),
     )
     await callback.answer()
 
@@ -1004,18 +1652,22 @@ async def pub_myvote(callback: CallbackQuery):
     )
 
     if row:
-        text = f"Твой голос принят.\nРегион - {row['region']}\nПартия - {row['party']}"
+        text = (
+            "<b>✅ Голос принят</b>\n\n"
+            f"Регион - <b>{row['region']}</b>\n"
+            f"Партия - <b>{row['party']}</b>\n\n"
+            "Изменить голос после подтверждения нельзя."
+        )
     else:
-        text = "Ты еще не голосовал в текущих выборах."
+        text = (
+            "<b>🗳 Ты еще не голосовал</b>\n\n"
+            "Когда голосование открыто, выбери регион и партию."
+        )
 
     await safe_edit(
         callback.message,
         text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="Назад", callback_data="pub:home")]
-            ]
-        ),
+        reply_markup=back_home_keyboard(),
     )
     await callback.answer()
 
@@ -1023,7 +1675,7 @@ async def pub_myvote(callback: CallbackQuery):
 @dp.callback_query(F.data == "pub:vote")
 async def pub_vote(callback: CallbackQuery):
     if not is_running():
-        await callback.answer("Сейчас голосование не идет.", show_alert=True)
+        await callback.answer("Сейчас голосование закрыто.", show_alert=True)
         return
 
     existing = db_query_one(
@@ -1031,15 +1683,14 @@ async def pub_vote(callback: CallbackQuery):
         (callback.from_user.id,),
     )
     if existing:
-        await callback.answer(
-            f"Ты уже голосовал: {existing['party']} - {existing['region']}",
-            show_alert=True,
-        )
+        await callback.answer("Ты уже проголосовал.", show_alert=True)
         return
 
     await safe_edit(
         callback.message,
-        "Выбери свой регион:",
+        "<b>🗳 Голосование</b>\n\n"
+        "<b>Шаг 1 из 2</b>\n"
+        "Выбери регион, в котором голосуешь:",
         reply_markup=regions_keyboard(),
     )
     await callback.answer()
@@ -1054,7 +1705,7 @@ async def vote_region(callback: CallbackQuery):
     try:
         region_index = int(callback.data.split(":")[2])
     except Exception:
-        await callback.answer("Ошибка региона.", show_alert=True)
+        await callback.answer("Не удалось открыть регион.", show_alert=True)
         return
 
     region = region_name_by_index(region_index)
@@ -1064,7 +1715,10 @@ async def vote_region(callback: CallbackQuery):
 
     await safe_edit(
         callback.message,
-        f"Регион - {region}\n\nТеперь выбери партию:",
+        "<b>🗳 Голосование</b>\n\n"
+        "<b>Шаг 2 из 2</b>\n"
+        f"Регион - <b>{region}</b>\n\n"
+        "Выбери партию:",
         reply_markup=parties_keyboard(region_index),
     )
     await callback.answer()
@@ -1081,18 +1735,21 @@ async def vote_party(callback: CallbackQuery):
         region_index = int(region_index)
         party_index = int(party_index)
     except Exception:
-        await callback.answer("Ошибка выбора.", show_alert=True)
+        await callback.answer("Не удалось обработать выбор.", show_alert=True)
         return
 
     region = region_name_by_index(region_index)
     party = party_name_by_index(party_index)
     if not region or not party:
-        await callback.answer("Ошибка выбора.", show_alert=True)
+        await callback.answer("Не удалось обработать выбор.", show_alert=True)
         return
 
     await safe_edit(
         callback.message,
-        f"Подтвердить голос?\n\nРегион - {region}\nПартия - {party}",
+        "<b>Проверь голос</b>\n\n"
+        f"🗺 Регион - <b>{region}</b>\n"
+        f"{PARTY_ICONS[party]} Партия - <b>{party}</b>\n\n"
+        "После подтверждения изменить голос нельзя.",
         reply_markup=confirm_keyboard(region_index, party_index),
     )
     await callback.answer()
@@ -1140,16 +1797,23 @@ async def vote_confirm(callback: CallbackQuery):
 
     await safe_edit(
         callback.message,
-        f"Голос принят.\n\nРегион - {region}\nПартия - {party}",
+        "<b>✅ Голос принят</b>\n\n"
+        f"🗺 Регион - <b>{region}</b>\n"
+        f"{PARTY_ICONS[party]} Партия - <b>{party}</b>\n\n"
+        "Спасибо. Теперь можешь следить за явкой и результатами в реальном времени.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="Результаты", callback_data="pub:results")],
-                [InlineKeyboardButton(text="В меню", callback_data="pub:home")],
+                [
+                    InlineKeyboardButton(text="📊 Результаты", callback_data="pub:results"),
+                    InlineKeyboardButton(text="🏠 Главная", callback_data="pub:home"),
+                ],
             ]
         ),
     )
-    await callback.answer("Голос принят.")
+    await callback.answer("Голос принят")
     await update_scoreboard(force=True)
+    await update_live_maps(force=True)
+    await update_channel_map(force=True)
 
 
 async def admin_guard(callback: CallbackQuery):
@@ -1182,6 +1846,8 @@ async def adm_test_yes(callback: CallbackQuery):
         "Три дня выборов сейчас будут проиграны в ускоренном режиме."
     )
     await publish_new_scoreboard(callback.message.chat.id)
+    await update_live_maps(force=True)
+    await update_channel_map(force=True)
     await callback.answer("Тест запущен.")
 
 
@@ -1205,6 +1871,8 @@ async def adm_prod_yes(callback: CallbackQuery):
     start_new_election("prod")
     await callback.message.answer("Выборы запущены на 3 дня.")
     await publish_new_scoreboard(callback.message.chat.id)
+    await update_live_maps(force=True)
+    await update_channel_map(force=True)
     await callback.answer("Выборы запущены.")
 
 
@@ -1219,6 +1887,8 @@ async def adm_pause(callback: CallbackQuery):
 
     pause_election()
     await update_scoreboard(force=True)
+    await update_live_maps(force=True)
+    await update_channel_map(force=True)
     await callback.answer("Пауза включена.")
 
 
@@ -1233,6 +1903,8 @@ async def adm_resume(callback: CallbackQuery):
 
     resume_election()
     await update_scoreboard(force=True)
+    await update_live_maps(force=True)
+    await update_channel_map(force=True)
     await callback.answer("Выборы продолжены.")
 
 
@@ -1252,11 +1924,79 @@ async def adm_publish(callback: CallbackQuery):
     await callback.answer("Новое живое табло создано.")
 
 
+@dp.callback_query(F.data == "adm:map")
+async def adm_map(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+
+    await send_live_map(callback.message.chat.id)
+    await callback.answer("Живая карта создана")
+
+
+@dp.callback_query(F.data == "adm:channel")
+async def adm_channel(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+
+    await callback.message.answer(
+        channel_admin_text(),
+        reply_markup=channel_admin_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "adm:channel_refresh")
+async def adm_channel_refresh(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+
+    if not connected_channel_id():
+        await callback.answer("Канал не подключен.", show_alert=True)
+        return
+
+    ok = await publish_or_update_channel_map(force_new=False)
+    await callback.answer(
+        "Карта в канале обновлена." if ok else "Не удалось обновить карту.",
+        show_alert=not ok,
+    )
+
+
+@dp.callback_query(F.data == "adm:channel_disconnect")
+async def adm_channel_disconnect(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+
+    if not connected_channel_id():
+        await callback.answer("Канал уже отключен.", show_alert=True)
+        return
+
+    await disconnect_channel(delete_post=True)
+    await callback.message.answer(
+        "<b>📢 Канал отключен</b>\n\n"
+        "Пост с картой удален, автоматические обновления остановлены."
+    )
+    await callback.answer("Канал отключен")
+
+
 @dp.callback_query(F.data == "adm:status")
 async def adm_status(callback: CallbackQuery):
     if not await admin_guard(callback):
         return
-    await callback.message.answer(build_scoreboard(admin=True))
+    text = build_scoreboard(admin=True)
+    channel_title = get_setting("channel_title", "").strip()
+    if connected_channel_id():
+        text += f"\n\n📢 Канал - <b>{channel_title or connected_channel_id()}</b>"
+    else:
+        text += "\n\n📢 Канал - <b>не подключен</b>"
+
+    await callback.message.answer(text)
+    await callback.answer()
+
+@dp.callback_query(F.data == "adm:regions")
+async def adm_regions(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    await callback.message.answer(build_regions_text(admin=True))
     await callback.answer()
 
 
@@ -1271,6 +2011,8 @@ async def adm_turnout(callback: CallbackQuery):
         "Посмотреть скрытые значения - /adminstatus"
     )
     await update_scoreboard(force=True)
+    await update_live_maps(force=True)
+    await update_channel_map(force=True)
     await callback.answer("Явка обновлена.")
 
 
@@ -1305,6 +2047,8 @@ async def adm_finish_yes(callback: CallbackQuery):
 
     finalize_election()
     await update_scoreboard(force=True)
+    await update_live_maps(force=True)
+    await update_channel_map(force=True)
     await callback.message.answer("Выборы завершены, остаток досчитан.")
     await callback.answer()
 
@@ -1333,6 +2077,8 @@ async def adm_reset_yes(callback: CallbackQuery):
     set_setting("ends_at", "0")
     set_setting("paused_at", "0")
     await update_scoreboard(force=True)
+    await update_live_maps(force=True)
+    await update_channel_map(force=True)
     await callback.message.answer("Все голоса сброшены. Выборы остановлены.")
     await callback.answer()
 
@@ -1423,7 +2169,7 @@ async def main():
 
     init_db()
 
-    bot = Bot(BOT_TOKEN)
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
     # Если процесс перезапустился во время активных выборов,
     # симуляция продолжится из сохраненного состояния SQLite.
